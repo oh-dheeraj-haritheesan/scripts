@@ -1,20 +1,47 @@
 #!/usr/bin/env python3
 """
-what-shipped.py — list Jira tickets that went into a blueprint release.
+what-shipped.py — list the Jira tickets that went into a blueprint release.
 
-Reads the target blueprint's dependency manifest, compares it against a baseline
-(by default the numerically previous blueprint in the same product family), and
-for each app whose pinned version changed, walks the sibling app repo's git log
-between the two versions and extracts ticket keys from commit subjects.
+What it does
+------------
+Given a dmm-tools blueprint name (e.g. `WRN_2_17_Android`), prints the set of
+Jira tickets that landed in each app between this blueprint and the previous
+one in the same product family. Useful for "what's in this release?" / release-
+notes / customer-comms work, without manually diffing 4+ app repos by hand.
 
-Patch resolution is best-effort: tries an exact tag match first, falls back to
-the tip of `release/<major>.<minor>` and warns. Run `git fetch` in the relevant
-repos first if your local refs may be stale.
+How it works
+------------
+1. Reads the target's pinned app versions from `dmm-tools/dependencies/<bp>.json`
+   (and `archive/dependencies/` as a fallback).
+2. Picks a baseline blueprint — by default the numerically previous one in the
+   same family (WRN_2_17 -> WRN_2_16); override with `--baseline`.
+3. For each app whose version differs between baseline and target:
+   a. Looks up the artifact in Artifactory to get the exact commit SHA
+      (Jenkins-era artifacts via `vcs.revision`; GHA-era via the build info's
+      `GITHUB_SHA`).
+   b. Falls back to `release/<major>.<minor>` branch tip if Artifactory can't
+      resolve the SHA, and warns that patch differences may be misreported.
+   c. Runs `git log <baseline-sha>..<target-sha>` in the sibling app repo and
+      extracts ticket keys (TFM-1234, EXR-567, PAS-89, ...) from commit subjects.
+4. Auth for Artifactory is read from `~/.gradle/gradle.properties`
+   (`artifactory_user` + `artifactory_password`); override with $ARTIFACTORY_TOKEN.
+   No auth -> still works, falls back to branch tips throughout.
+5. App repos are discovered by their GitHub origin remote, so directory names
+   on disk don't have to match the canonical repo name.
 
-Usage:
-  scripts/what-shipped.py WRN_2_17_Android
-  scripts/what-shipped.py WRN_2_17_Android --baseline WRN_2_15_Android
-  scripts/what-shipped.py WRN_2_17_Android --verbose
+Setup
+-----
+- Edit DMM_TOOLS_PATH below to point at your local dmm-tools clone.
+- Sibling app clones (android-system-ops, wrn2, ipr2, ...) are expected to live
+  next to dmm-tools. Override with --projects-root if your layout differs.
+
+Usage
+-----
+  what-shipped.py WRN_2_17_Android
+  what-shipped.py WRN_2_17_Android --baseline WRN_2_15_Android
+  what-shipped.py WRN_2_17_Android --verbose        # show commit subjects
+  what-shipped.py WRN_2_17_Android --no-fetch       # skip the auto `git fetch`
+  what-shipped.py WRN_2_17_Android --no-links       # disable terminal hyperlinks
 """
 
 import argparse
@@ -77,7 +104,7 @@ ARTIFACT_FILE_EXT = "zip"
 # App repos (android-system-ops, wrn2, ipr2, ...) are assumed to be siblings of this path.
 # Leave as None to fall back to this script's parent directory (works only if this file
 # lives inside dmm-tools/scripts/).
-DMM_TOOLS_PATH = None
+DMM_TOOLS_PATH = "/Users/Dheerajkumar.Haritheesan/PP_Projects/dmm-tools"
 
 # Match either git@github.com:owner/repo(.git) or https://github.com/owner/repo(.git)
 REMOTE_SLUG_RE = re.compile(r"github\.com[:/]([^/]+/[^/]+?)(?:\.git)?/?$")
@@ -317,16 +344,25 @@ def main():
 
     if DMM_TOOLS_PATH:
         dmm_tools = Path(DMM_TOOLS_PATH).expanduser().resolve()
+        if not (dmm_tools / "dependencies").exists():
+            sys.exit(
+                f"error: DMM_TOOLS_PATH points to {dmm_tools}, which is not a valid dmm-tools clone\n"
+                f"       (no `dependencies/` directory found there).\n"
+                f"\n"
+                f"Open {Path(__file__).resolve()} and update DMM_TOOLS_PATH near the top to\n"
+                f"the absolute path of your local dmm-tools clone — e.g.\n"
+                f'       DMM_TOOLS_PATH = "/Users/yourname/PP_Projects/dmm-tools"'
+            )
     else:
         dmm_tools = Path(__file__).resolve().parent.parent
         if not (dmm_tools / "dependencies").exists():
             sys.exit(
                 "error: DMM_TOOLS_PATH is not set and this script is not inside dmm-tools/scripts/.\n"
-                "Open this file and set DMM_TOOLS_PATH near the top to the absolute path of your\n"
-                "local dmm-tools clone (e.g. \"/Users/you/PP_Projects/dmm-tools\")."
+                "\n"
+                f"Open {Path(__file__).resolve()} and set DMM_TOOLS_PATH near the top to\n"
+                "the absolute path of your local dmm-tools clone — e.g.\n"
+                '       DMM_TOOLS_PATH = "/Users/yourname/PP_Projects/dmm-tools"'
             )
-    if not (dmm_tools / "dependencies").exists():
-        sys.exit(f"error: {dmm_tools} does not look like a dmm-tools clone (no `dependencies/` directory).")
 
     dep_dirs = [dmm_tools / "dependencies", dmm_tools / "archive" / "dependencies"]
     projects_root = Path(args.projects_root) if args.projects_root else dmm_tools.parent
