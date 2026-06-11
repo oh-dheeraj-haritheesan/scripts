@@ -94,6 +94,15 @@ ARTIFACT_PATH_MAP = {
     "dmm": "com/patientpoint/dmm/production/dmm-pr",
 }
 
+# Maps library version keys (from libs.versions.toml or gradle.properties) to the
+# GitHub repo and Artifactory artifact needed to resolve exact commit SHAs.
+# Keys are all variant names a repo might use for the same library.
+LIBRARY_VERSION_REPO_MAP = {
+    "pp-core":      {"slug": "contextmedia/android-core", "artifact_path": "com/patientpoint/core/core-code", "artifact_ext": "aar"},
+    "coreVersion":  {"slug": "contextmedia/android-core", "artifact_path": "com/patientpoint/core/core-code", "artifact_ext": "aar"},
+    "core_version": {"slug": "contextmedia/android-core", "artifact_path": "com/patientpoint/core/core-code", "artifact_ext": "aar"},
+}
+
 ARTIFACTORY_BASE = os.environ.get("ARTIFACTORY_URL", "https://outcomehealth.jfrog.io/artifactory").rstrip("/")
 MAVEN_REPO = "tfm-maven"
 ARTIFACT_FILE_EXT = "zip"
@@ -213,16 +222,18 @@ def http_get_json(url: str, auth_header: str):
     return result
 
 
-def resolve_sha_via_artifactory(dep_key: str, version: str, auth_header: str):
+def resolve_sha_via_artifactory(dep_key: str, version: str, auth_header: str,
+                                artifact_path: str = None, artifact_ext: str = None):
     """Return (sha, warning) for a published artifact version via Artifactory."""
-    artifact_path = ARTIFACT_PATH_MAP.get(dep_key)
+    artifact_path = artifact_path or ARTIFACT_PATH_MAP.get(dep_key)
     if not artifact_path:
         return None, "no artifact path configured for this app"
+    artifact_ext = artifact_ext or ARTIFACT_FILE_EXT
     artifact_id = artifact_path.rsplit("/", 1)[-1]
 
     props_url = (
         f"{ARTIFACTORY_BASE}/api/storage/{MAVEN_REPO}/{artifact_path}/"
-        f"{version}/{artifact_id}-{version}.{ARTIFACT_FILE_EXT}?properties"
+        f"{version}/{artifact_id}-{version}.{artifact_ext}?properties"
     )
     data, err = http_get_json(props_url, auth_header)
     if err:
@@ -286,7 +297,8 @@ def fetch_repo(repo: Path):
     return False, (r.stderr.strip() or "fetch failed").splitlines()[0]
 
 
-def resolve_ref(repo: Path, version: str, dep_key: str = None, auth_header: str = None):
+def resolve_ref(repo: Path, version: str, dep_key: str = None, auth_header: str = None,
+               artifact_path: str = None, artifact_ext: str = None):
     """Return (ref, warning) for a version string.
 
     Resolution order:
@@ -295,7 +307,8 @@ def resolve_ref(repo: Path, version: str, dep_key: str = None, auth_header: str 
       3. Tip of `release/<major>.<minor>` (may misreport patch version differences).
     """
     if auth_header and dep_key:
-        sha, err = resolve_sha_via_artifactory(dep_key, version, auth_header)
+        sha, err = resolve_sha_via_artifactory(dep_key, version, auth_header,
+                                               artifact_path=artifact_path, artifact_ext=artifact_ext)
         if sha:
             if git(repo, "rev-parse", "--verify", sha).returncode == 0:
                 return sha, None
@@ -328,6 +341,78 @@ def commits_between(repo: Path, base_ref: str, head_ref: str):
             sha, subject = line.split("\t", 1)
             out.append((sha, subject))
     return out, None
+
+
+# Matches version-like values: at least one dot with digits on both sides,
+# optional pre-release suffix (e.g. "1.3-SNAPSHOT", "2.0.0-beta01").
+_VERSION_VALUE_RE = re.compile(r"^\d+\.\d[\w.\-]*$")
+
+
+def _parse_toml_versions(content: str) -> dict:
+    """Extract {key: version} from the [versions] section of a libs.versions.toml."""
+    versions = {}
+    in_versions = False
+    for line in content.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("["):
+            in_versions = stripped == "[versions]"
+            continue
+        if not in_versions or not stripped or stripped.startswith("#"):
+            continue
+        # Strip inline comment before parsing
+        stripped = re.sub(r"\s*#.*$", "", stripped)
+        if "=" not in stripped:
+            continue
+        k, _, v = stripped.partition("=")
+        v = v.strip().strip('"')
+        if v:
+            versions[k.strip()] = v
+    return versions
+
+
+def _parse_gradle_prop_versions(content: str) -> dict:
+    """Extract version-like entries from a gradle.properties file."""
+    versions = {}
+    for line in content.splitlines():
+        s = line.strip()
+        if not s or s.startswith(("#", "!")) or "=" not in s:
+            continue
+        k, _, v = s.partition("=")
+        k, v = k.strip(), v.strip()
+        # Skip known non-version gradle/android settings
+        if "." in k:
+            continue
+        if _VERSION_VALUE_RE.match(v):
+            versions[k] = v
+    return versions
+
+
+def read_library_versions_at_ref(repo: Path, ref: str):
+    """Return ({key: version}, source_label) at the given git ref.
+
+    Tries gradle/libs.versions.toml first, then gradle.properties.
+    Returns ({}, None) if neither file is present at that ref.
+    """
+    for path, parser, label in (
+        ("gradle/libs.versions.toml", _parse_toml_versions, "libs.versions.toml"),
+        ("gradle.properties", _parse_gradle_prop_versions, "gradle.properties"),
+    ):
+        r = git(repo, "show", f"{ref}:{path}")
+        if r.returncode == 0 and r.stdout.strip():
+            return parser(r.stdout), label
+    return {}, None
+
+
+def diff_library_versions(base_versions: dict, head_versions: dict):
+    """Return list of (key, old_ver, new_ver) for entries that changed or were added."""
+    changes = []
+    all_keys = sorted(set(base_versions) | set(head_versions))
+    for k in all_keys:
+        old = base_versions.get(k)
+        new = head_versions.get(k)
+        if old != new:
+            changes.append((k, old, new))
+    return changes
 
 
 def main():
@@ -408,13 +493,28 @@ def main():
                 print(f"  {slug} ({repo.name}): {status}")
             print()
 
-    all_tickets = set()
+    # Group changed deps by (slug, baseline_version, target_version) so that keys sharing
+    # the same repo and version transition (e.g. system-ops + zygote) print as one section.
+    from collections import defaultdict
+    groups = defaultdict(list)   # (slug, baseline_ver, target_ver) -> [key, ...]
+    ungrouped = []               # (key, baseline_ver, target_ver) for keys with no repo
+
     for key, target_version in target_deps.items():
         baseline_version = baseline_deps.get(key)
         if baseline_version == target_version:
             continue
+        slug = REPO_MAP.get(key) if key in REPO_MAP else "__unknown__"
+        if slug and slug != "__unknown__":
+            groups[(slug, baseline_version or "", target_version)].append(key)
+        else:
+            ungrouped.append((key, baseline_version, target_version, slug))
 
-        header = f"## {key}: {baseline_version or '(new)'} -> {target_version}"
+    all_tickets = set()
+
+    for (slug, baseline_version, target_version), keys in groups.items():
+        baseline_version = baseline_version or None
+        label = " + ".join(keys)
+        header = f"## {label}: {baseline_version or '(new)'} -> {target_version}"
         print(header)
 
         if baseline_version is None:
@@ -422,22 +522,19 @@ def main():
             print()
             continue
 
-        if key not in REPO_MAP:
-            print(f"  WARN: unknown dependency key '{key}'; add to REPO_MAP")
-            print()
-            continue
-        slug = REPO_MAP[key]
-        if slug is None:
+        slug_resolved = slug  # already a real slug here
+        if slug_resolved is None:
             print("  external dependency; no local repo")
             print()
             continue
 
-        repo = slug_to_repo.get(slug.lower())
+        repo = slug_to_repo.get(slug_resolved.lower())
         if repo is None:
-            print(f"  WARN: no local clone of {slug} found under {projects_root}")
+            print(f"  WARN: no local clone of {slug_resolved} found under {projects_root}")
             print()
             continue
 
+        key = keys[0]  # use first key for Artifactory lookup
         base_ref, base_warn = resolve_ref(repo, baseline_version, dep_key=key, auth_header=artifactory_auth)
         head_ref, head_warn = resolve_ref(repo, target_version, dep_key=key, auth_header=artifactory_auth)
         for w in (base_warn, head_warn):
@@ -474,6 +571,93 @@ def main():
                         if s not in seen:
                             print(f"      {s}")
                             seen.add(s)
+
+        base_lib_versions, base_lib_source = read_library_versions_at_ref(repo, base_ref)
+        head_lib_versions, head_lib_source = read_library_versions_at_ref(repo, head_ref)
+        source_mismatch = base_lib_source and head_lib_source and base_lib_source != head_lib_source
+        if source_mismatch:
+            base_items = sorted(base_lib_versions.items())
+            head_items = sorted(head_lib_versions.items())
+            if base_items or head_items:
+                print(f"\n  Library versions (source changed: {base_lib_source} -> {head_lib_source}):")
+                lk_w = max((len(k) for k, _ in base_items), default=0)
+                lv_w = max((len(v) for _, v in base_items), default=0)
+                rk_w = max((len(k) for k, _ in head_items), default=0)
+                col_w = lk_w + lv_w + 4
+                header_l = f"Baseline ({base_lib_source})"
+                header_r = f"Target ({head_lib_source})"
+                print(f"    {header_l:<{col_w}}  {header_r}")
+                print(f"    {'-' * col_w}  {'-' * (rk_w + max((len(v) for _, v in head_items), default=0) + 4)}")
+                for (lk, lv), (rk, rv) in zip(base_items, head_items):
+                    left = f"{lk:<{lk_w}}  {lv}"
+                    print(f"    {left:<{col_w}}  {rk:<{rk_w}}  {rv}")
+                for (lk, lv) in base_items[len(head_items):]:
+                    print(f"    {lk:<{lk_w}}  {lv}")
+                for (rk, rv) in head_items[len(base_items):]:
+                    print(f"    {'':<{col_w}}  {rk:<{rk_w}}  {rv}")
+        else:
+            lib_changes = diff_library_versions(base_lib_versions, head_lib_versions)
+            if lib_changes:
+                source_label = head_lib_source or base_lib_source or "unknown"
+                print(f"\n  Library version changes ({source_label}):")
+                key_width = max(len(k) for k, _, _ in lib_changes)
+                for lib_key, old_ver, new_ver in lib_changes:
+                    old_str = old_ver if old_ver is not None else "(new)"
+                    new_str = new_ver if new_ver is not None else "(removed)"
+                    print(f"    {lib_key:<{key_width}}  {old_str}  ->  {new_str}")
+
+                    lib_info = LIBRARY_VERSION_REPO_MAP.get(lib_key)
+                    if not lib_info or old_ver is None or new_ver is None:
+                        continue
+                    lib_repo = slug_to_repo.get(lib_info["slug"].lower())
+                    if lib_repo is None:
+                        print(f"      (no local clone of {lib_info['slug']} found; skipping ticket diff)")
+                        continue
+                    lib_base_ref, lib_base_warn = resolve_ref(
+                        lib_repo, old_ver, dep_key=lib_key, auth_header=artifactory_auth,
+                        artifact_path=lib_info["artifact_path"], artifact_ext=lib_info["artifact_ext"],
+                    )
+                    lib_head_ref, lib_head_warn = resolve_ref(
+                        lib_repo, new_ver, dep_key=lib_key, auth_header=artifactory_auth,
+                        artifact_path=lib_info["artifact_path"], artifact_ext=lib_info["artifact_ext"],
+                    )
+                    for w in (lib_base_warn, lib_head_warn):
+                        if w:
+                            print(f"      WARN: {w}")
+                    if not lib_base_ref or not lib_head_ref:
+                        print(f"      could not resolve both refs; skipping ticket diff")
+                        continue
+                    lib_commits, lib_err = commits_between(lib_repo, lib_base_ref, lib_head_ref)
+                    if lib_err:
+                        print(f"      git error: {lib_err}")
+                        continue
+                    lib_tickets = {}
+                    for sha, subject in lib_commits:
+                        for t in set(TICKET_RE.findall(subject)):
+                            lib_tickets.setdefault(t, []).append(subject)
+                            all_tickets.add(t)
+                    if not lib_tickets:
+                        print(f"      ({len(lib_commits)} commits, no ticket references found)")
+                    else:
+                        print(f"      ({len(lib_commits)} commits, {len(lib_tickets)} unique tickets)")
+                        for t in sorted(lib_tickets):
+                            linked = hyperlink(t, f"{JIRA_BASE_URL}{t}", links_enabled)
+                            print(f"      - {linked}")
+                            if args.verbose:
+                                seen = set()
+                                for s in lib_tickets[t]:
+                                    if s not in seen:
+                                        print(f"          {s}")
+                                        seen.add(s)
+
+        print()
+
+    for key, baseline_version, target_version, slug in ungrouped:
+        print(f"## {key}: {baseline_version or '(new)'} -> {target_version}")
+        if slug == "__unknown__":
+            print(f"  WARN: unknown dependency key '{key}'; add to REPO_MAP")
+        else:
+            print("  external dependency; no local repo")
         print()
 
     print(f"Total unique tickets across all apps: {len(all_tickets)}")
