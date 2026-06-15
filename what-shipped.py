@@ -52,6 +52,7 @@ import re
 import subprocess
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -105,6 +106,7 @@ LIBRARY_VERSION_REPO_MAP = {
 
 ARTIFACTORY_BASE = os.environ.get("ARTIFACTORY_URL", "https://outcomehealth.jfrog.io/artifactory").rstrip("/")
 MAVEN_REPO = "tfm-maven"
+JIRA_API_BASE = "https://jirapp.atlassian.net/rest/api/3"
 ARTIFACT_FILE_EXT = "zip"
 
 # >>> EDIT THIS <<<
@@ -204,6 +206,64 @@ def load_artifactory_auth():
     return None, None
 
 
+def load_jira_auth():
+    """Resolve Jira auth header. Returns (header_value, source_label) or (None, None).
+
+    Order: $JIRA_TOKEN + $JIRA_USER (Bearer) -> ~/.gradle/gradle.properties (Basic).
+    """
+    tok = os.environ.get("JIRA_TOKEN")
+    user = os.environ.get("JIRA_USER")
+    if tok and user:
+        encoded = base64.b64encode(f"{user}:{tok}".encode()).decode()
+        return f"Basic {encoded}", "$JIRA_USER + $JIRA_TOKEN"
+    props = parse_gradle_properties(Path.home() / ".gradle" / "gradle.properties")
+    user = props.get("jira_user")
+    pw = props.get("jira_token")
+    if user and pw:
+        encoded = base64.b64encode(f"{user}:{pw}".encode()).decode()
+        return f"Basic {encoded}", "~/.gradle/gradle.properties"
+    return None, None
+
+
+def fetch_jira_titles(ticket_keys, auth_header):
+    """Return {ticket_key: title} for the given keys via a single JQL batch request."""
+    if not auth_header or not ticket_keys:
+        return {}
+    keys_str = ", ".join(sorted(ticket_keys))
+    jql = f"issueKey in ({keys_str})"
+    url = f"{JIRA_API_BASE}/search/jql"
+    payload = {"jql": jql, "fields": ["summary", "customfield_10011"], "maxResults": len(ticket_keys)}
+    data, err = http_post_json(url, payload, auth_header)
+    if err:
+        print(f"  WARN: Jira title fetch failed: {err}", file=sys.stderr)
+        return {}
+    if not data:
+        return {}
+    titles = {}
+    for issue in data.get("issues", []):
+        key = issue.get("key")
+        fields = issue.get("fields") or {}
+        summary = fields.get("summary") or fields.get("customfield_10011")
+        if key and summary:
+            titles[key] = summary
+
+    # For migrated tickets Jira returns the new key (e.g. OPS-76) instead of the
+    # queried key (e.g. TFM-6587), so the batch result won't contain the original key.
+    # Fall back to individual lookups for any queried key that wasn't matched.
+    missing = [k for k in ticket_keys if k not in titles]
+    for k in missing:
+        url = f"{JIRA_API_BASE}/issue/{k}?fields=summary,customfield_10011"
+        issue_data, err = http_get_json(url, auth_header)
+        if err or not issue_data:
+            continue
+        fields = issue_data.get("fields") or {}
+        summary = fields.get("summary") or fields.get("customfield_10011")
+        if summary:
+            titles[k] = summary
+
+    return titles
+
+
 def http_get_json(url: str, auth_header: str):
     """GET a URL with the given Authorization header value and decode JSON. Returns (data, error)."""
     if url in _HTTP_CACHE:
@@ -220,6 +280,22 @@ def http_get_json(url: str, auth_header: str):
         result = (None, f"{type(e).__name__}: {e}")
     _HTTP_CACHE[url] = result
     return result
+
+
+def http_post_json(url: str, payload: dict, auth_header: str):
+    """POST JSON to a URL with the given Authorization header and decode the response. Returns (data, error)."""
+    body = json.dumps(payload).encode()
+    req = urllib.request.Request(
+        url, data=body,
+        headers={"Authorization": auth_header, "Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r:
+            return json.loads(r.read()), None
+    except urllib.error.HTTPError as e:
+        return None, f"HTTP {e.code} from {url}"
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as e:
+        return None, f"{type(e).__name__}: {e}"
 
 
 def resolve_sha_via_artifactory(dep_key: str, version: str, auth_header: str,
@@ -313,9 +389,6 @@ def resolve_ref(repo: Path, version: str, dep_key: str = None, auth_header: str 
             if git(repo, "rev-parse", "--verify", sha).returncode == 0:
                 return sha, None
             return None, f"got SHA {sha[:12]} from Artifactory but it's not in the local repo (try `git fetch` in {repo.name})"
-        artifactory_note = f"Artifactory lookup unavailable ({err})"
-    else:
-        artifactory_note = None
 
     for tag in (version, f"v{version}"):
         if git(repo, "rev-parse", "--verify", f"refs/tags/{tag}").returncode == 0:
@@ -324,10 +397,7 @@ def resolve_ref(repo: Path, version: str, dep_key: str = None, auth_header: str 
     if pv:
         for br in (f"origin/release/{pv[0]}.{pv[1]}", f"release/{pv[0]}.{pv[1]}"):
             if git(repo, "rev-parse", "--verify", br).returncode == 0:
-                msg = f"no tag '{version}'; using tip of {br} (may misreport patch differences)"
-                if artifactory_note:
-                    msg = f"{artifactory_note}; {msg}"
-                return br, msg
+                return br, f"no tag '{version}'; using tip of {br} (may misreport patch differences)"
     return None, f"could not resolve version '{version}'"
 
 
@@ -467,6 +537,7 @@ def main():
     baseline_deps = json.loads(baseline_file.read_text())
 
     artifactory_auth, auth_source = load_artifactory_auth()
+    jira_auth, jira_auth_source = load_jira_auth()
 
     print(f"Target:   {args.blueprint}")
     print(f"Baseline: {baseline_name}")
@@ -475,6 +546,11 @@ def main():
     else:
         print("Artifactory: OFF — set artifactory_user/artifactory_password in ~/.gradle/gradle.properties "
               "(or export $ARTIFACTORY_TOKEN) for exact SHA resolution")
+    if jira_auth:
+        print(f"Jira: ON — fetching ticket titles (auth: {jira_auth_source})")
+    else:
+        print("Jira: OFF — set jira_user/jira_token in ~/.gradle/gradle.properties "
+              "(or export $JIRA_USER + $JIRA_TOKEN) to show ticket titles")
     print()
 
     slug_to_repo = {k.lower(): v for k, v in discover_repos(projects_root).items()}
@@ -562,9 +638,11 @@ def main():
             print(f"  ({len(commits)} commits, no ticket references found)")
         else:
             print(f"  ({len(commits)} commits, {len(tickets)} unique tickets)")
+            titles = fetch_jira_titles(list(tickets.keys()), jira_auth)
             for t in sorted(tickets):
                 linked = hyperlink(t, f"{JIRA_BASE_URL}{t}", links_enabled)
-                print(f"  - {linked}")
+                title = titles.get(t)
+                print(f"  - {linked}" + (f"  {title}" if title else ""))
                 if args.verbose:
                     seen = set()
                     for s in tickets[t]:
@@ -640,9 +718,11 @@ def main():
                         print(f"      ({len(lib_commits)} commits, no ticket references found)")
                     else:
                         print(f"      ({len(lib_commits)} commits, {len(lib_tickets)} unique tickets)")
+                        lib_titles = fetch_jira_titles(list(lib_tickets.keys()), jira_auth)
                         for t in sorted(lib_tickets):
                             linked = hyperlink(t, f"{JIRA_BASE_URL}{t}", links_enabled)
-                            print(f"      - {linked}")
+                            title = lib_titles.get(t)
+                            print(f"      - {linked}" + (f"  {title}" if title else ""))
                             if args.verbose:
                                 seen = set()
                                 for s in lib_tickets[t]:
